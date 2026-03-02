@@ -1,0 +1,126 @@
+name: Git Tag
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to tag (e.g. 1.2.3) - required for manual run'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: git-tag-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  git-tag:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    permissions:
+      contents: write
+    steps:
+      - name: Extract version from release branch
+        id: extract_version
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eventName = context.eventName;
+            const payload = context.payload;
+
+            if (eventName === 'pull_request') {
+              const pr = payload.pull_request;
+              const sourceBranch = pr.head.ref;
+              const mergeCommitSha = pr.merge_commit_sha;
+
+              core.info(`Source branch: ${sourceBranch}`);
+
+              if (!mergeCommitSha) {
+                core.warning('No merge_commit_sha (rebase-and-merge?). Use merge or squash merge for tagging.');
+                core.setOutput('is_release', 'false');
+                return;
+              }
+
+              const match = sourceBranch.match(/^(release|hotfix)\/v(\d+\.\d+\.\d+)$/);
+              if (match) {
+                const version = match[2];
+                const branchType = match[1];
+                core.setOutput('is_release', 'true');
+                core.setOutput('version', version);
+                core.setOutput('commit_sha', mergeCommitSha);
+                core.info(`✓ ${branchType} branch detected: v${version}`);
+              } else {
+                core.setOutput('is_release', 'false');
+                core.info('Branch does not match release/vX.X.X or hotfix/vX.X.X format - skipping tag');
+              }
+            } else if (eventName === 'workflow_dispatch') {
+              const version = (payload.inputs && payload.inputs.version || '').trim();
+              if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
+                core.setOutput('is_release', 'false');
+                core.info('Manual run: no valid version input (X.X.X) - skipping tag');
+                return;
+              }
+              core.setOutput('is_release', 'true');
+              core.setOutput('version', version);
+              core.setOutput('commit_sha', context.sha);
+              core.info(`✓ Manual run: tagging v${version} at ${context.sha}`);
+            }
+
+      - name: Validate tag does not exist
+        if: steps.extract_version.outputs.is_release == 'true'
+        id: validate_tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ steps.extract_version.outputs.version }}';
+            const commitSha = '${{ steps.extract_version.outputs.commit_sha }}';
+            const tagRef = `tags/v${version}`;
+
+            try {
+              const { data: existingTag } = await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: tagRef
+              });
+
+              if (existingTag.object.sha === commitSha) {
+                core.info(`Tag v${version} already exists for this commit - skipping`);
+                core.setOutput('skip_tag', 'true');
+              } else {
+                core.setFailed(
+                  `✗ Tag v${version} already exists and points to a different commit (${existingTag.object.sha}).\n` +
+                  `Cannot reuse version ${version} for commit ${commitSha}.\n` +
+                  `Please increment the version number in your release branch.`
+                );
+              }
+            } catch (e) {
+              if (e.status === 404) {
+                core.info(`✓ Tag v${version} does not exist - proceeding with creation`);
+                core.setOutput('skip_tag', 'false');
+              } else {
+                throw e;
+              }
+            }
+
+      - name: Create build tag
+        if: steps.extract_version.outputs.is_release == 'true' && steps.validate_tag.outputs.skip_tag != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ steps.extract_version.outputs.version }}';
+            const commitSha = '${{ steps.extract_version.outputs.commit_sha }}';
+            const tag = `v${version}`;
+
+            await github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `refs/tags/${tag}`,
+              sha: commitSha
+            });
+
+            core.info(`✓ Successfully created tag ${tag} for commit ${commitSha}`);
